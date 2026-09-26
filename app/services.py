@@ -267,12 +267,28 @@ def _state_from_db(conn: sqlite3.Connection, roll_no: str) -> dict:
 
 
 def get_roll_state(conn: sqlite3.Connection, roll_no: str) -> schemas.RollState | None:
-    if not conn.execute(
-        "SELECT 1 FROM batches WHERE roll_no = ? LIMIT 1", (roll_no,)
-    ).fetchone():
-        return None
-    st = _state_from_db(conn, roll_no)
-    metas = _batch_metas(conn, roll_no)
+    """查询单个胶卷的完整状态（只读，不改任何数据）。
+
+    批次存在性判定、预期区间、实扫帧、缺帧区间与各批次明细在**同一个
+    SQLite 只读事务**中读取，全部来自同一已提交状态：并发导入或撤销
+    （尤其是撤销最后一批）不会拼出“批次存在但汇总为空”（如
+    batch_count=0 的空胶卷）的跨查询撕裂结果。事务开启时最后一批
+    已撤销（已提交）则返回 None（接口 404）；撤销在本事务提交后才
+    生效的，本次仍返回撤销前完整一致的状态，下一次查询即看到新状态。
+    """
+    conn.execute("BEGIN")
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM batches WHERE roll_no = ? LIMIT 1", (roll_no,)
+        ).fetchone():
+            conn.execute("COMMIT")
+            return None
+        st = _state_from_db(conn, roll_no)
+        metas = _batch_metas(conn, roll_no)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     frames_sorted = sorted(st["frames"])
     return schemas.RollState(
         roll_no=roll_no,
@@ -287,23 +303,35 @@ def get_roll_state(conn: sqlite3.Connection, roll_no: str) -> schemas.RollState 
 
 
 def list_rolls(conn: sqlite3.Connection) -> list[schemas.RollSummary]:
-    rows = conn.execute(
-        """SELECT roll_no,
-                  (SELECT COUNT(*) FROM roll_frames f WHERE f.roll_no = b.roll_no) AS total,
-                  COUNT(*) AS batch_count
-             FROM batches b GROUP BY roll_no ORDER BY roll_no"""
-    ).fetchall()
-    out: list[schemas.RollSummary] = []
-    for r in rows:
-        st = _state_from_db(conn, r["roll_no"])
-        out.append(
-            schemas.RollSummary(
-                roll_no=r["roll_no"],
-                total_frames=r["total"],
-                batch_count=r["batch_count"],
-                missing_ranges=[list(x) for x in st["missing"]],
+    """列出全部胶卷的汇总状态（只读，不改任何数据）。
+
+    整份列表在**同一个 SQLite 只读事务**中生成：每个胶卷的批次数、
+    帧数与缺帧区间都来自同一已提交状态，并发导入或撤销不会造成
+    跨胶卷或跨字段的撕裂（例如批次数与缺帧区间对应不同时刻）。
+    """
+    conn.execute("BEGIN")
+    try:
+        rows = conn.execute(
+            """SELECT roll_no,
+                      (SELECT COUNT(*) FROM roll_frames f WHERE f.roll_no = b.roll_no) AS total,
+                      COUNT(*) AS batch_count
+                 FROM batches b GROUP BY roll_no ORDER BY roll_no"""
+        ).fetchall()
+        out: list[schemas.RollSummary] = []
+        for r in rows:
+            st = _state_from_db(conn, r["roll_no"])
+            out.append(
+                schemas.RollSummary(
+                    roll_no=r["roll_no"],
+                    total_frames=r["total"],
+                    batch_count=r["batch_count"],
+                    missing_ranges=[list(x) for x in st["missing"]],
+                )
             )
-        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     return out
 
 

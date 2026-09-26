@@ -284,13 +284,22 @@ def delete_batch(batch_id: str, conn: Connection = Depends(database.get_db)):
 
 @app.get("/rolls", response_model=list[schemas.RollSummary], tags=["胶卷"])
 def list_rolls(conn: Connection = Depends(database.get_db)):
-    """列出所有胶卷及其汇总状态。"""
+    """列出所有胶卷及其汇总状态。
+
+    整份列表在同一个 SQLite 只读事务中生成：每个胶卷的批次数、帧数与
+    缺帧区间都来自同一已提交状态，并发导入或撤销不会造成跨查询撕裂。
+    """
     return services.list_rolls(conn)
 
 
 @app.get("/rolls/{roll_no}", response_model=schemas.RollState, tags=["胶卷"])
 def get_roll(roll_no: str, conn: Connection = Depends(database.get_db)):
-    """查询单个胶卷的合并帧号、重复帧明细与连续缺帧区间。"""
+    """查询单个胶卷的合并帧号、重复帧明细与连续缺帧区间。
+
+    批次存在性判定、预期区间、实扫帧与批次明细在同一个 SQLite 只读事务
+    中读取，全部来自同一已提交状态；最后一批已撤销时返回 404，
+    下一次查询即可见新状态。
+    """
     result = services.get_roll_state(conn, roll_no.strip())
     if result is None:
         raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
