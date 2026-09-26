@@ -21,7 +21,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="胶片档案扫描整理 API",
     description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比；支持单批次采集质量审查（批内重复率、越界帧、预期内缺口及稳定告警代码）；支持批次导入预检（持久化预检单、确认时在同一写事务内复核创建时的单调批次修订号，任何实际批次导入/撤销均使旧预检 409 失效）；支持扫描瑕疵复核（按原始帧列表 0 起算位置登记模糊/划痕/曝光异常，实时计算全出现被标记的瑕疵队列）；支持胶卷交付核验（同一事务内核验三类阻断项，全空时签发冻结核验依据与状态指纹的持久化凭证，凭证按当前批次与瑕疵标记重算有效性，历史凭证不改写）；支持胶卷母版选片（在请求区间与当前预期覆盖的交集内逐帧剔除瑕疵出现，按最少批次切换选择每帧母版来源，返回未扫描区间与无合格候选帧，缺帧只做区间运算）；支持批次帧号整体偏移诊断（按其余存活批次重建实扫基线与缺帧，区间事件扫描求最优整体偏移，严格优于零偏移才给出建议）。",
-    version="1.13.0",
+    version="1.13.1",
     lifespan=lifespan,
 )
 
@@ -284,13 +284,23 @@ def delete_batch(batch_id: str, conn: Connection = Depends(database.get_db)):
 
 @app.get("/rolls", response_model=list[schemas.RollSummary], tags=["胶卷"])
 def list_rolls(conn: Connection = Depends(database.get_db)):
-    """列出所有胶卷及其汇总状态。"""
+    """列出所有胶卷及其汇总状态。
+
+    整份列表在一次只读事务中生成：每个胶卷的批次数、帧数与缺帧区间取自
+    同一已提交快照，并发批次导入/撤销不会造成跨查询状态撕裂；最后一批
+    已撤销的胶卷不会出现在列表中。
+    """
     return services.list_rolls(conn)
 
 
 @app.get("/rolls/{roll_no}", response_model=schemas.RollState, tags=["胶卷"])
 def get_roll(roll_no: str, conn: Connection = Depends(database.get_db)):
-    """查询单个胶卷的合并帧号、重复帧明细与连续缺帧区间。"""
+    """查询单个胶卷的合并帧号、重复帧明细与连续缺帧区间。
+
+    整份结果在一次只读事务中生成：批次存在性、预期区间、实扫帧与各批
+    明细取自同一已提交快照，并发批次导入/撤销不会造成跨查询状态撕裂；
+    最后一批已撤销（快照下无存活批次）时返回 404，下一次查询即见新状态。
+    """
     result = services.get_roll_state(conn, roll_no.strip())
     if result is None:
         raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")

@@ -267,12 +267,30 @@ def _state_from_db(conn: sqlite3.Connection, roll_no: str) -> dict:
 
 
 def get_roll_state(conn: sqlite3.Connection, roll_no: str) -> schemas.RollState | None:
-    if not conn.execute(
-        "SELECT 1 FROM batches WHERE roll_no = ? LIMIT 1", (roll_no,)
-    ).fetchone():
-        return None
-    st = _state_from_db(conn, roll_no)
-    metas = _batch_metas(conn, roll_no)
+    """读取单个胶卷的合并帧号、重复帧明细与连续缺帧区间。
+
+    整份结果在**一次只读事务**内生成：批次存在性、预期区间、实扫帧与
+    批次明细取自同一已提交快照。没有显式事务时每条 SELECT 各自取最新
+    快照，若存在性检查之后、明细读取之前最后一批恰好被并发撤销，就会
+    返回 ``200`` 且 ``batch_count=0`` 的空胶卷（跨查询状态撕裂）。
+    ``BEGIN`` 开启的一致性读把全部读取钉在同一已提交状态：该快照下
+    已无存活批次时直接返回 ``None``（接口 404）；撤销发生在读快照之后
+    时本次仍返回撤销前的完整一致状态，下一次查询即见新状态。
+    """
+    conn.execute("BEGIN")
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM batches WHERE roll_no = ? LIMIT 1", (roll_no,)
+        ).fetchone():
+            conn.execute("COMMIT")
+            return None
+        st = _state_from_db(conn, roll_no)
+        metas = _batch_metas(conn, roll_no)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
     frames_sorted = sorted(st["frames"])
     return schemas.RollState(
         roll_no=roll_no,
@@ -287,15 +305,31 @@ def get_roll_state(conn: sqlite3.Connection, roll_no: str) -> schemas.RollState 
 
 
 def list_rolls(conn: sqlite3.Connection) -> list[schemas.RollSummary]:
-    rows = conn.execute(
-        """SELECT roll_no,
-                  (SELECT COUNT(*) FROM roll_frames f WHERE f.roll_no = b.roll_no) AS total,
-                  COUNT(*) AS batch_count
-             FROM batches b GROUP BY roll_no ORDER BY roll_no"""
-    ).fetchall()
+    """列出所有胶卷及其汇总状态。
+
+    整份列表在**一次只读事务**内生成：胶卷分组（各卷批次数、帧数）与
+    每卷的缺帧区间取自同一已提交快照。否则分组查询与逐卷状态读取分属
+    不同快照，并发导入/撤销时会出现批次数、帧数与缺帧区间互相对不上，
+    或已撤销最后一批的胶卷仍残留在列表中（跨查询状态撕裂）。一致性读
+    保证每个条目都对应一个真实存活的胶卷状态；撤销在快照之后提交时，
+    本次仍返回撤销前的完整列表，下一次查询即见新状态。
+    """
+    conn.execute("BEGIN")
+    try:
+        rows = conn.execute(
+            """SELECT roll_no,
+                      (SELECT COUNT(*) FROM roll_frames f WHERE f.roll_no = b.roll_no) AS total,
+                      COUNT(*) AS batch_count
+                 FROM batches b GROUP BY roll_no ORDER BY roll_no"""
+        ).fetchall()
+        states = [_state_from_db(conn, r["roll_no"]) for r in rows]
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
     out: list[schemas.RollSummary] = []
-    for r in rows:
-        st = _state_from_db(conn, r["roll_no"])
+    for r, st in zip(rows, states):
         out.append(
             schemas.RollSummary(
                 roll_no=r["roll_no"],
